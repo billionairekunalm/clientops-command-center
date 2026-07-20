@@ -2129,6 +2129,51 @@ body {
     margin-top: 0;
     border-top: 0;
   }
+
+  /* Mobile Flex wrapping to prevent horizontal overflows */
+  .ongoing-row {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 16px;
+  }
+  .ongoing-client {
+    min-width: unset;
+    flex: 1 1 100%;
+  }
+  .ongoing-action {
+    min-width: unset;
+    flex: 1 1 100%;
+    margin-top: 4px;
+  }
+  .pipeline-container {
+    flex: 1 1 auto;
+  }
+
+  .directory-row {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 14px;
+  }
+  .directory-name {
+    min-width: unset;
+    flex: 1 1 100%;
+  }
+  .directory-next {
+    min-width: unset;
+    flex: 1 1 100%;
+  }
+
+  .meeting-card {
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+  }
+  .meeting-card > div:nth-child(4) {
+    flex: 1 1 100%;
+  }
+  .meet-button {
+    margin-left: auto;
+  }
 }
 
 @media (max-width: 480px) {
@@ -2143,9 +2188,13 @@ body {
   }
   .modal {
     padding: 24px 16px;
+    max-height: 95vh;
   }
   .modal-grid-2 {
     grid-template-columns: 1fr;
+  }
+  .client-panel {
+    padding: 24px 16px;
   }
 }
 
