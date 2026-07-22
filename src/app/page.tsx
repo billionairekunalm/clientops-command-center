@@ -2787,9 +2787,77 @@ function VoiceOnboardModal({
   const [isListening, setIsListening] = useState(false);
   const [manualInputVal, setManualInputVal] = useState("");
   
+  const [audioLevels, setAudioLevels] = useState<number[]>([4, 4, 4, 4, 4]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const animationFrameIdRef = useRef<number | null>(null);
+  
   const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  const startVolumeTracking = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const audioContext = new AudioCtx();
+        audioContextRef.current = audioContext;
+        
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 32;
+        source.connect(analyser);
+        
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        
+        const updateVolume = () => {
+          if (!analyser) return;
+          analyser.getByteFrequencyData(dataArray);
+          
+          let total = 0;
+          for (let i = 0; i < bufferLength; i++) {
+            total += dataArray[i];
+          }
+          const average = total / bufferLength;
+          
+          const mappedLevels = [
+            Math.max(4, Math.min(30, average * 0.3)),
+            Math.max(4, Math.min(30, average * 0.6)),
+            Math.max(4, Math.min(30, average * 0.8)),
+            Math.max(4, Math.min(30, average * 0.5)),
+            Math.max(4, Math.min(30, average * 0.2)),
+          ];
+          
+          setAudioLevels(mappedLevels);
+          animationFrameIdRef.current = requestAnimationFrame(updateVolume);
+        };
+        
+        updateVolume();
+      }
+    } catch (err) {
+      console.warn("Failed to track audio volume levels:", err);
+    }
+  };
+
+  const stopVolumeTracking = useCallback(() => {
+    if (animationFrameIdRef.current) {
+      cancelAnimationFrame(animationFrameIdRef.current);
+      animationFrameIdRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => track.stop());
+      audioStreamRef.current = null;
+    }
+    setAudioLevels([4, 4, 4, 4, 4]);
+  }, []);
 
   // Initialize Speech engines
   useEffect(() => {
@@ -2799,17 +2867,26 @@ function VoiceOnboardModal({
       if (RecognitionClass) {
         const rec = new RecognitionClass();
         rec.continuous = true;
-        rec.interimResults = false;
+        rec.interimResults = true;
         rec.lang = "en-US";
 
         rec.onresult = (e: any) => {
-          const resultText = e.results[e.results.length - 1][0].transcript.trim();
-          setTranscript(resultText);
-          setManualInputVal(resultText);
+          let interimText = "";
+          for (let i = e.resultIndex; i < e.results.length; ++i) {
+            if (e.results[i].isFinal) {
+              const finalVal = e.results[i][0].transcript.trim();
+              setTranscript(finalVal);
+              setManualInputVal(finalVal);
+            } else {
+              interimText += e.results[i][0].transcript;
+              setManualInputVal(interimText);
+            }
+          }
         };
 
         rec.onend = () => {
           setIsListening(false);
+          stopVolumeTracking();
         };
 
         recognitionRef.current = rec;
@@ -2823,29 +2900,32 @@ function VoiceOnboardModal({
       if (synthRef.current) {
         synthRef.current.cancel();
       }
+      stopVolumeTracking();
     };
-  }, []);
+  }, [stopVolumeTracking]);
 
   // Stop listening helper
-  const stopListening = () => {
+  const stopListening = useCallback(() => {
     if (recognitionRef.current) {
       recognitionRef.current.stop();
       setIsListening(false);
+      stopVolumeTracking();
     }
-  };
+  }, [stopVolumeTracking]);
 
   // Start listening helper
-  const startListening = () => {
+  const startListening = useCallback(() => {
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start();
         setIsListening(true);
         setTranscript("");
+        startVolumeTracking();
       } catch (err) {
         console.warn("Recognition already started or error:", err);
       }
     }
-  };
+  }, []);
 
   // Speaks text, and once finished, automatically starts listening
   const speakAndListen = useCallback((text: string) => {
@@ -2861,7 +2941,7 @@ function VoiceOnboardModal({
     };
     
     synthRef.current.speak(utterance);
-  }, []);
+  }, [stopListening, startListening]);
 
   // State machine step transitions
   useEffect(() => {
@@ -2999,22 +3079,18 @@ function VoiceOnboardModal({
         {step !== "START" && step !== "CONFIRM" && step !== "COMPLETED" && (
           <div style={{ margin: "20px 0" }}>
             <div style={{ display: "flex", justifyContent: "center", gap: "6px", height: "30px", alignItems: "center", marginBottom: "16px" }}>
-              {isListening ? (
-                [1, 2, 3, 4, 5].map((i) => (
-                  <span 
-                    key={i} 
-                    style={{ 
-                      width: "4px", 
-                      height: "100%", 
-                      background: "var(--purple)", 
-                      borderRadius: "2px", 
-                      animation: `pulseGlow 0.6s infinite alternate ${i * 0.1}s` 
-                    }} 
-                  />
-                ))
-              ) : (
-                <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Processing speech...</span>
-              )}
+              {audioLevels.map((level, i) => (
+                <span 
+                  key={i} 
+                  style={{ 
+                    width: "4px", 
+                    height: `${level}px`, 
+                    background: "var(--purple)", 
+                    borderRadius: "2px", 
+                    transition: "height 0.08s ease"
+                  }} 
+                />
+              ))}
             </div>
 
             <div style={{ background: "var(--bg-card-hover)", padding: "16px", borderRadius: "12px", border: "1px solid var(--border-color)", marginBottom: "20px" }}>
@@ -3191,7 +3267,75 @@ function VoiceSchedulerModal({
   const [isProcessing, setIsProcessing] = useState(false);
   const [parsedItems, setParsedItems] = useState<any[]>([]);
   
+  const [audioLevels, setAudioLevels] = useState<number[]>([4, 4, 4, 4, 4]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const animationFrameIdRef = useRef<number | null>(null);
+  
   const recognitionRef = useRef<any>(null);
+
+  const startVolumeTracking = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const audioContext = new AudioCtx();
+        audioContextRef.current = audioContext;
+        
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 32;
+        source.connect(analyser);
+        
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        
+        const updateVolume = () => {
+          if (!analyser) return;
+          analyser.getByteFrequencyData(dataArray);
+          
+          let total = 0;
+          for (let i = 0; i < bufferLength; i++) {
+            total += dataArray[i];
+          }
+          const average = total / bufferLength;
+          
+          const mappedLevels = [
+            Math.max(4, Math.min(30, average * 0.3)),
+            Math.max(4, Math.min(30, average * 0.6)),
+            Math.max(4, Math.min(30, average * 0.8)),
+            Math.max(4, Math.min(30, average * 0.5)),
+            Math.max(4, Math.min(30, average * 0.2)),
+          ];
+          
+          setAudioLevels(mappedLevels);
+          animationFrameIdRef.current = requestAnimationFrame(updateVolume);
+        };
+        
+        updateVolume();
+      }
+    } catch (err) {
+      console.warn("Failed to track audio volume levels:", err);
+    }
+  };
+
+  const stopVolumeTracking = useCallback(() => {
+    if (animationFrameIdRef.current) {
+      cancelAnimationFrame(animationFrameIdRef.current);
+      animationFrameIdRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => track.stop());
+      audioStreamRef.current = null;
+    }
+    setAudioLevels([4, 4, 4, 4, 4]);
+  }, []);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -3199,16 +3343,25 @@ function VoiceSchedulerModal({
       if (RecognitionClass) {
         const rec = new RecognitionClass();
         rec.continuous = true;
-        rec.interimResults = false;
+        rec.interimResults = true;
         rec.lang = "en-US";
 
         rec.onresult = (e: any) => {
-          const resultText = e.results[e.results.length - 1][0].transcript.trim();
-          setAgendaText((prev) => (prev ? prev + " " + resultText : resultText));
+          let interimText = "";
+          for (let i = e.resultIndex; i < e.results.length; ++i) {
+            if (e.results[i].isFinal) {
+              const finalVal = e.results[i][0].transcript.trim();
+              setAgendaText((prev) => (prev ? prev + " " + finalVal : finalVal));
+            } else {
+              interimText += e.results[i][0].transcript;
+              setAgendaText(interimText);
+            }
+          }
         };
 
         rec.onend = () => {
           setIsListening(false);
+          stopVolumeTracking();
         };
 
         recognitionRef.current = rec;
@@ -3219,14 +3372,16 @@ function VoiceSchedulerModal({
       if (recognitionRef.current) {
         recognitionRef.current.stop();
       }
+      stopVolumeTracking();
     };
-  }, []);
+  }, [stopVolumeTracking]);
 
   const startListening = () => {
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start();
         setIsListening(true);
+        startVolumeTracking();
       } catch (err) {
         console.warn("Recognition already started:", err);
       }
@@ -3237,6 +3392,7 @@ function VoiceSchedulerModal({
     if (recognitionRef.current) {
       recognitionRef.current.stop();
       setIsListening(false);
+      stopVolumeTracking();
     }
   };
 
@@ -3341,6 +3497,22 @@ function VoiceSchedulerModal({
             placeholder={isListening ? "Listening... Speak your tasks or meetings..." : "Speak or type agenda (e.g. Tomorrow at 11 AM meet with Santosh Pawar to review design, and send invoice to Deepak)"}
             style={{ width: "100%", height: "100px", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", color: "var(--text-main)", fontSize: "13px", resize: "none", outline: 0 }}
           />
+
+          {/* Audio Equalizer bars visualizer */}
+          <div style={{ display: "flex", justifyContent: "center", gap: "6px", height: "30px", alignItems: "center", margin: "4px 0" }}>
+            {audioLevels.map((level, i) => (
+              <span 
+                key={i} 
+                style={{ 
+                  width: "4px", 
+                  height: `${level}px`, 
+                  background: "var(--purple)", 
+                  borderRadius: "2px", 
+                  transition: "height 0.08s ease"
+                }} 
+              />
+            ))}
+          </div>
 
           <div style={{ display: "flex", gap: "8px" }}>
             <button 
