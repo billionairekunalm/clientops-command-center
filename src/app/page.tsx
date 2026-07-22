@@ -1670,6 +1670,14 @@ export default function Home() {
             <button 
               type="button"
               className="primary-button" 
+              style={{ background: "linear-gradient(135deg, var(--sky), var(--purple))", display: "inline-flex", gap: "6px" }}
+              onClick={() => setChatOnboardOpen(true)}
+            >
+              💬 Chat Onboard
+            </button>
+            <button 
+              type="button"
+              className="primary-button" 
               style={{ background: "linear-gradient(135deg, var(--purple), var(--sky))", display: "inline-flex", gap: "6px" }}
               onClick={() => {
                 if (!geminiApiKey) {
