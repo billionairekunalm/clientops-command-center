@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import {
@@ -22,7 +23,7 @@ import {
   UserIcon,
   Cog6ToothIcon,
 } from "@heroicons/react/24/outline";
-import { useMemo, useState, useEffect, Fragment } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback, Fragment } from "react";
 import { supabase } from "../utils/supabase";
 
 type Stage = "Closing" | "Active work" | "Delivery" | "Proposal";
@@ -206,6 +207,103 @@ function formatDueLabel(dueStr: string): string {
   }
 }
 
+// Global voice AI helpers
+async function parseAgendaWithGemini(
+  apiKey: string,
+  agendaText: string,
+  clients: Client[]
+): Promise<any> {
+  const clientsContext = clients.map((c) => ({ id: c.id, name: c.name, company: c.company }));
+  const prompt = `You are a scheduling AI. Analyze the following spoken daily agenda: "${agendaText}".
+We have the following registered clients: ${JSON.stringify(clientsContext)}.
+Extract all tasks or meetings mentioned in the agenda. Match the "clientName" in each item to one of our registered clients (return the exact client name or matching client ID if found, or empty string if it's a general task).
+Return the result strictly conforming to the requested schema.`;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      tasks: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            title: { type: "STRING" },
+            clientName: { type: "STRING" },
+            type: { type: "STRING", enum: ["meeting", "task"] },
+            time: { type: "STRING" },
+            due: { type: "STRING", enum: ["Today", "Tomorrow", "Friday", "This week", "Later"] }
+          },
+          required: ["title", "clientName", "type", "due"]
+        }
+      }
+    }
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: schema
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini API error: ${errorText}`);
+  }
+
+  const resData = await response.json();
+  const textContent = resData.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!textContent) {
+    throw new Error("Empty response from Gemini API");
+  }
+
+  return JSON.parse(textContent);
+}
+
+const getFormattedDueDate = (category: string, timeStr?: string) => {
+  const date = new Date();
+  if (category === "Tomorrow") {
+    date.setDate(date.getDate() + 1);
+  } else if (category === "Friday") {
+    const day = date.getDay();
+    const daysUntilFriday = (5 - day + 7) % 7 || 7;
+    date.setDate(date.getDate() + daysUntilFriday);
+  } else if (category === "This week") {
+    const day = date.getDay();
+    const daysUntilSunday = (7 - day) % 7;
+    date.setDate(date.getDate() + daysUntilSunday);
+  } else if (category === "Later") {
+    date.setDate(date.getDate() + 7);
+  }
+  
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  
+  let timeVal = "10:00";
+  if (timeStr) {
+    const match = timeStr.match(/(\d+):?(\d*)\s*(AM|PM)?/i);
+    if (match) {
+      let hrs = parseInt(match[1], 10);
+      const mins = match[2] ? match[2].padStart(2, '0') : "00";
+      const ampm = match[3];
+      if (ampm && ampm.toUpperCase() === "PM" && hrs < 12) hrs += 12;
+      if (ampm && ampm.toUpperCase() === "AM" && hrs === 12) hrs = 0;
+      timeVal = `${String(hrs).padStart(2, '0')}:${mins}`;
+    }
+  }
+  
+  return `${yyyy}-${mm}-${dd}T${timeVal}`;
+};
+
 function Avatar({ client, size = "md" }: { client: Client; size?: "sm" | "md" | "lg" }) {
   if (client.logo) {
     return (
@@ -300,8 +398,16 @@ export default function Home() {
     }
     return "";
   });
+  const [geminiApiKey, setGeminiApiKey] = useState(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("gemini_api_key") || "";
+    }
+    return "";
+  });
   const [isProfileOpen, setProfileOpen] = useState(false);
   const [isSettingsOpen, setSettingsOpen] = useState(false);
+  const [isVoiceOnboardOpen, setVoiceOnboardOpen] = useState(false);
+  const [isVoiceSchedulerOpen, setVoiceSchedulerOpen] = useState(false);
   const [isLoggedOut, setIsLoggedOut] = useState(false);
 
   const handleSaveProfile = async (name: string, role: string, initials: string, avatarUrl: string) => {
@@ -381,6 +487,10 @@ export default function Home() {
             setAdminAvatar(profData.avatar_url || "");
             setCurrentWorkspace(profData.workspace_name);
             setTheme(profData.theme as "light" | "dark");
+            if (profData.gemini_api_key) {
+              setGeminiApiKey(profData.gemini_api_key);
+              localStorage.setItem("gemini_api_key", profData.gemini_api_key);
+            }
           }
         } catch (profErr) {
           console.error("Failed to fetch admin profile:", profErr);
@@ -1028,6 +1138,152 @@ export default function Home() {
     }
   };
 
+  // Submit all voice scheduled actions in a single batch
+  const handleVoiceScheduleSubmit = async (tasksToInsert: any[], meetingsToUpdate: any[]) => {
+    // 1. Process tasks
+    for (const t of tasksToInsert) {
+      const newTaskId = getNextUniqueId();
+      const newTask: Task = {
+        id: newTaskId,
+        title: t.title,
+        clientId: t.clientId || undefined,
+        due: t.due,
+        done: false,
+        priority: "medium",
+      };
+      
+      setTaskState((current) => [newTask, ...current]);
+      
+      try {
+        const { error } = await supabase.from("tasks").insert([{
+          id: newTask.id,
+          title: newTask.title,
+          client_id: newTask.clientId,
+          due: newTask.due,
+          done: newTask.done,
+          priority: newTask.priority
+        }]);
+        if (error) throw error;
+      } catch (err) {
+        console.error("Supabase batch insert task failed:", err);
+      }
+    }
+
+    // 2. Process meetings
+    for (const m of meetingsToUpdate) {
+      if (!m.clientId) continue;
+      
+      setClients((currentClients) =>
+        currentClients.map((c) => {
+          if (c.id === m.clientId) {
+            const logItem = {
+              id: getNextUniqueId(),
+              title: "Meeting Scheduled",
+              desc: `Spoken agenda: "${m.title}"`,
+              date: "Today",
+            };
+            const updated: Client = {
+              ...c,
+              nextAction: m.title,
+              due: m.due,
+              eventType: "meeting",
+              timeline: [logItem, ...c.timeline],
+            };
+            if (selected && selected.id === c.id) {
+              setSelected(updated);
+            }
+            return updated;
+          }
+          return c;
+        })
+      );
+
+      try {
+        const matched = clients.find(c => c.id === m.clientId);
+        if (matched) {
+          const logItem = {
+            id: getNextUniqueId(),
+            title: "Meeting Scheduled",
+            desc: `Spoken agenda: "${m.title}"`,
+            date: "Today",
+          };
+          const { error } = await supabase
+            .from("clients")
+            .update({
+              next_action: m.title,
+              due: m.due,
+              event_type: "meeting",
+              timeline: [logItem, ...matched.timeline]
+            })
+            .eq("id", m.clientId);
+          if (error) throw error;
+        }
+      } catch (err) {
+        console.error("Supabase batch meeting update failed:", err);
+      }
+    }
+  };
+
+  const handleVoiceOnboardingSubmit = async (data: Partial<Client>) => {
+    const name = data.name || "New client";
+    const company = data.company || "Independent";
+    const dealAmount = data.dealAmount || 0;
+    const paymentSteps = data.paymentSteps || 1;
+    const nextAction = data.nextAction || "Schedule first follow-up";
+    const due = getFormattedDueDate(data.due || "Today");
+    const tone = data.tone || "violet";
+    const initials = data.initials || "CL";
+
+    const newClientId = getNextUniqueId();
+    const newClient: Client = {
+      id: newClientId,
+      name,
+      company,
+      initials,
+      tone,
+      stage: "Proposal",
+      health: "green",
+      priority: 50,
+      nextAction,
+      due,
+      note: "Onboarded via Voice AI Copilot.",
+      timeline: [
+        { id: getNextUniqueId(), title: "Voice onboarding", desc: "Profile onboarded using Voice AI Copilot dialogue.", date: "Today" },
+      ],
+      eventType: "task",
+      dealAmount,
+      paymentSteps,
+      paidSteps: 0
+    };
+
+    setClients((current) => [newClient, ...current]);
+    setSelected(newClient);
+
+    try {
+      const { error } = await supabase.from("clients").insert([{
+        id: newClient.id,
+        name: newClient.name,
+        company: newClient.company,
+        initials: newClient.initials,
+        tone: newClient.tone,
+        stage: newClient.stage,
+        health: newClient.health,
+        priority: newClient.priority,
+        next_action: newClient.nextAction,
+        due: newClient.due,
+        note: newClient.note,
+        timeline: newClient.timeline,
+        event_type: newClient.eventType,
+        deal_amount: newClient.dealAmount,
+        payment_steps: newClient.paymentSteps,
+        paid_steps: newClient.paidSteps
+      }]);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Supabase insert voice client failed:", err);
+    }
+  };
+
   // Parse clients to populate dynamic events on the calendar
   const calendarEvents = useMemo(() => {
     return clients.map((client) => {
@@ -1307,6 +1563,21 @@ export default function Home() {
               <i />
             </button>
 
+            <button 
+              type="button"
+              className="primary-button" 
+              style={{ background: "linear-gradient(135deg, var(--purple), var(--sky))", display: "inline-flex", gap: "6px" }}
+              onClick={() => {
+                if (!geminiApiKey) {
+                  addToast("Please configure your Gemini API Key in Settings first!", "warning");
+                  setSettingsOpen(true);
+                  return;
+                }
+                setVoiceOnboardOpen(true);
+              }}
+            >
+              🎙️ Voice Onboard
+            </button>
             <button className="primary-button" onClick={() => setAddOpen(true)}>
               <PlusIcon /> Add client
             </button>
@@ -1657,6 +1928,14 @@ export default function Home() {
             onToggle={handleToggleTask}
             onDelete={handleDeleteTask}
             onAddTask={handleAddTask}
+            onStartVoiceScheduler={() => {
+              if (!geminiApiKey) {
+                addToast("Please configure your Gemini API Key in Settings first!", "warning");
+                setSettingsOpen(true);
+                return;
+              }
+              setVoiceSchedulerOpen(true);
+            }}
           />
         )}
 
@@ -1718,25 +1997,51 @@ export default function Home() {
         <SettingsModal
           currentWorkspace={currentWorkspace}
           onClose={() => setSettingsOpen(false)}
-          onSaveWorkspace={async (ws) => {
+          onSaveWorkspace={async (ws, gKey) => {
             setCurrentWorkspace(ws);
+            setGeminiApiKey(gKey);
+            if (typeof window !== "undefined") {
+              localStorage.setItem("gemini_api_key", gKey);
+            }
             try {
               const { error } = await supabase
                 .from("profiles")
                 .upsert({
                   id: "admin",
                   workspace_name: ws,
+                  gemini_api_key: gKey,
                   updated_at: new Date().toISOString()
                 });
               if (error) throw error;
-              addToast(`Workspace updated to ${ws} and synced!`, "success");
+              addToast(`Settings updated and synced!`, "success");
             } catch (err) {
-              console.error("Failed to sync workspace name:", err);
-              addToast(`Workspace name updated to ${ws}!`, "success");
+              console.error("Failed to sync settings:", err);
+              addToast(`Settings updated locally!`, "success");
             }
           }}
           theme={theme}
           setTheme={setTheme}
+          geminiApiKey={geminiApiKey}
+        />
+      )}
+
+      {/* Voice Onboarding Copilot Modal */}
+      {isVoiceOnboardOpen && (
+        <VoiceOnboardModal
+          onClose={() => setVoiceOnboardOpen(false)}
+          onSubmit={handleVoiceOnboardingSubmit}
+          addToast={addToast}
+        />
+      )}
+
+      {/* Smart Voice Scheduler Modal */}
+      {isVoiceSchedulerOpen && (
+        <VoiceSchedulerModal
+          onClose={() => setVoiceSchedulerOpen(false)}
+          onSubmit={handleVoiceScheduleSubmit}
+          clients={clients}
+          geminiApiKey={geminiApiKey}
+          addToast={addToast}
         />
       )}
 
@@ -2445,6 +2750,680 @@ function HelpModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+type VoiceStep = 
+  | "START"
+  | "ASK_NAME" 
+  | "ASK_COMPANY" 
+  | "ASK_AMOUNT" 
+  | "ASK_STEPS" 
+  | "ASK_ACTION"
+  | "ASK_DUE"
+  | "CONFIRM"
+  | "COMPLETED";
+
+// Voice Onboarding Modal Component
+function VoiceOnboardModal({
+  onClose,
+  onSubmit,
+  addToast,
+}: {
+  onClose: () => void;
+  onSubmit: (client: Partial<Client>) => Promise<void>;
+  addToast: (msg: string, type?: Toast["type"]) => void;
+}) {
+  const [step, setStep] = useState<VoiceStep>("START");
+  const [clientData, setClientData] = useState<Partial<Client>>({
+    name: "",
+    company: "",
+    dealAmount: 0,
+    paymentSteps: 1,
+    nextAction: "",
+    due: "Today",
+    tone: "violet",
+    initials: "CL",
+  });
+  
+  const [transcript, setTranscript] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [manualInputVal, setManualInputVal] = useState("");
+  
+  const recognitionRef = useRef<any>(null);
+  const synthRef = useRef<SpeechSynthesis | null>(null);
+  const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  // Initialize Speech engines
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      synthRef.current = window.speechSynthesis;
+      const RecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (RecognitionClass) {
+        const rec = new RecognitionClass();
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.lang = "en-US";
+
+        rec.onresult = (e: any) => {
+          const resultText = e.results[e.results.length - 1][0].transcript.trim();
+          setTranscript(resultText);
+          setManualInputVal(resultText);
+        };
+
+        rec.onend = () => {
+          setIsListening(false);
+        };
+
+        recognitionRef.current = rec;
+      }
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+      if (synthRef.current) {
+        synthRef.current.cancel();
+      }
+    };
+  }, []);
+
+  // Stop listening helper
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
+  };
+
+  // Start listening helper
+  const startListening = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+        setTranscript("");
+      } catch (err) {
+        console.warn("Recognition already started or error:", err);
+      }
+    }
+  };
+
+  // Speaks text, and once finished, automatically starts listening
+  const speakAndListen = useCallback((text: string) => {
+    stopListening();
+    if (!synthRef.current) return;
+    
+    synthRef.current.cancel(); // Cancel any current utterances
+    const utterance = new SpeechSynthesisUtterance(text);
+    activeUtteranceRef.current = utterance;
+    
+    utterance.onend = () => {
+      startListening();
+    };
+    
+    synthRef.current.speak(utterance);
+  }, []);
+
+  // State machine step transitions
+  useEffect(() => {
+    if (step === "START") {
+      // Just waiting for user to click "Start Session"
+    } else if (step === "ASK_NAME") {
+      speakAndListen("What is the client's name?");
+    } else if (step === "ASK_COMPANY") {
+      speakAndListen("Which company do they belong to?");
+    } else if (step === "ASK_AMOUNT") {
+      speakAndListen("What is the deal contract amount?");
+    } else if (step === "ASK_STEPS") {
+      speakAndListen("How many payment steps or phases are there?");
+    } else if (step === "ASK_ACTION") {
+      speakAndListen("What is the next action to do for this client?");
+    } else if (step === "ASK_DUE") {
+      speakAndListen("When is the next action due?");
+    } else if (step === "CONFIRM") {
+      speakAndListen("I have collected all details. Review the form and say save, or click confirm.");
+    }
+  }, [step, speakAndListen]);
+
+  // Handle step submission
+  const handleStepSubmit = (textVal: string) => {
+    const cleanText = textVal.trim();
+    if (!cleanText && step !== "ASK_COMPANY") return;
+
+    const updated = { ...clientData };
+
+    if (step === "ASK_NAME") {
+      updated.name = cleanText;
+      const parts = cleanText.split(" ");
+      updated.initials = parts.map(p => p[0]).join("").toUpperCase().slice(0, 2) || "CL";
+      const tones = ["violet", "blue", "emerald", "rose", "amber"];
+      updated.tone = tones[Math.floor(Math.random() * tones.length)];
+      setClientData(updated);
+      setStep("ASK_COMPANY");
+    } else if (step === "ASK_COMPANY") {
+      updated.company = cleanText || "Independent";
+      setClientData(updated);
+      setStep("ASK_AMOUNT");
+    } else if (step === "ASK_AMOUNT") {
+      const matches = cleanText.replace(/,/g, "").match(/\d+/);
+      const val = matches ? parseInt(matches[0], 10) : 0;
+      updated.dealAmount = val;
+      setClientData(updated);
+      setStep("ASK_STEPS");
+    } else if (step === "ASK_STEPS") {
+      const matches = cleanText.match(/\d+/);
+      const val = matches ? parseInt(matches[0], 10) : 1;
+      updated.paymentSteps = val;
+      setClientData(updated);
+      setStep("ASK_ACTION");
+    } else if (step === "ASK_ACTION") {
+      updated.nextAction = cleanText;
+      setClientData(updated);
+      setStep("ASK_DUE");
+    } else if (step === "ASK_DUE") {
+      updated.due = cleanText;
+      setClientData(updated);
+      setStep("CONFIRM");
+    }
+    
+    setTranscript("");
+    setManualInputVal("");
+  };
+
+  const handleSave = async () => {
+    stopListening();
+    try {
+      await onSubmit(clientData);
+      setStep("COMPLETED");
+      addToast("Client successfully onboarded via voice!", "success");
+      setTimeout(() => {
+        onClose();
+      }, 1500);
+    } catch (err) {
+      console.error(err);
+      addToast("Failed to save client onboarding details.", "error");
+    }
+  };
+
+  const RecognitionClass = typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+  return (
+    <div className="overlay modal-wrap" role="dialog" aria-modal="true" aria-label="Voice client onboarding">
+      <div className="modal" style={{ width: "min(500px, 100%)", textAlign: "center" }}>
+        <button 
+          type="button" 
+          className="close" 
+          onClick={() => {
+            stopListening();
+            onClose();
+          }} 
+          aria-label="Close voice prompter"
+        >
+          <XMarkIcon />
+        </button>
+
+        <span className="modal-icon" style={{ background: "linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(14, 165, 233, 0.1))", color: "var(--purple)", margin: "0 auto 16px" }}>
+          🎙️
+        </span>
+        <h2>Voice Onboarding Copilot</h2>
+        <p style={{ color: "var(--text-muted)", fontSize: "12px", marginBottom: "20px" }}>
+          Onboard new clients hands-free using dynamic voice checks.
+        </p>
+
+        {!RecognitionClass && (
+          <div style={{ background: "rgba(244, 63, 94, 0.08)", border: "1px solid rgba(244,63,94,0.15)", borderRadius: "8px", padding: "12px", fontSize: "11px", color: "var(--rose)", marginBottom: "16px" }}>
+            ⚠️ Web Speech API is not supported in this browser. You can type conversational answers in the text box below.
+          </div>
+        )}
+
+        {step === "START" && (
+          <div style={{ margin: "24px 0" }}>
+            <p style={{ fontSize: "14px", color: "var(--text-main)", marginBottom: "20px" }}>
+              Ready to begin the interactive voice setup? Unlocks the mic and audio guidance.
+            </p>
+            <button 
+              type="button" 
+              className="primary-button" 
+              style={{ width: "100%", padding: "12px" }}
+              onClick={() => {
+                if (synthRef.current) {
+                  synthRef.current.speak(new SpeechSynthesisUtterance(""));
+                }
+                setStep("ASK_NAME");
+              }}
+            >
+              Start Voice Setup
+            </button>
+          </div>
+        )}
+
+        {step !== "START" && step !== "CONFIRM" && step !== "COMPLETED" && (
+          <div style={{ margin: "20px 0" }}>
+            <div style={{ display: "flex", justifyContent: "center", gap: "6px", height: "30px", alignItems: "center", marginBottom: "16px" }}>
+              {isListening ? (
+                [1, 2, 3, 4, 5].map((i) => (
+                  <span 
+                    key={i} 
+                    style={{ 
+                      width: "4px", 
+                      height: "100%", 
+                      background: "var(--purple)", 
+                      borderRadius: "2px", 
+                      animation: `pulseGlow 0.6s infinite alternate ${i * 0.1}s` 
+                    }} 
+                  />
+                ))
+              ) : (
+                <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Processing speech...</span>
+              )}
+            </div>
+
+            <div style={{ background: "var(--bg-card-hover)", padding: "16px", borderRadius: "12px", border: "1px solid var(--border-color)", marginBottom: "20px" }}>
+              <small style={{ fontSize: "9px", textTransform: "uppercase", color: "var(--purple)", fontWeight: 700, display: "block", marginBottom: "8px" }}>
+                Active Question
+              </small>
+              <strong style={{ fontSize: "16px", color: "var(--text-main)", display: "block" }}>
+                {step === "ASK_NAME" && "What is the client's name?"}
+                {step === "ASK_COMPANY" && "Which company do they belong to?"}
+                {step === "ASK_AMOUNT" && "What is the deal contract amount?"}
+                {step === "ASK_STEPS" && "How many payment steps or phases are there?"}
+                {step === "ASK_ACTION" && "What is the next action to do for this client?"}
+                {step === "ASK_DUE" && "When is the next action due?"}
+              </strong>
+            </div>
+
+            <form 
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleStepSubmit(manualInputVal);
+              }}
+              style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+            >
+              <input 
+                type="text" 
+                value={manualInputVal} 
+                onChange={(e) => setManualInputVal(e.target.value)}
+                placeholder={isListening ? "Listening... Speak your answer" : "Type answer here..."}
+                style={{ width: "100%", padding: "12px 16px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "8px", color: "var(--text-main)", fontSize: "13px", outline: 0 }}
+              />
+              {transcript && (
+                <p style={{ fontSize: "11px", color: "var(--text-muted)", fontStyle: "italic", marginTop: "4px" }}>
+                  Captured voice: &quot;{transcript}&quot;
+                </p>
+              )}
+              <div style={{ display: "flex", gap: "8px" }}>
+                <button 
+                  type="button" 
+                  style={{ flex: 1, height: "38px", background: "var(--bg-card)", border: "1px solid var(--border-color)", color: "var(--text-main)", borderRadius: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600 }}
+                  onClick={() => {
+                    if (isListening) stopListening();
+                    else startListening();
+                  }}
+                >
+                  {isListening ? "Mute Microphone" : "Unmute Mic"}
+                </button>
+                <button 
+                  type="submit" 
+                  className="primary-button" 
+                  style={{ padding: "0 24px" }}
+                >
+                  Next
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {step === "CONFIRM" && (
+          <div style={{ margin: "16px 0", textAlign: "left" }}>
+            <p style={{ fontSize: "13px", color: "var(--text-muted)", marginBottom: "16px", textAlign: "center" }}>
+              Please review the collected metadata. You can click any input box to edit details manually.
+            </p>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px", background: "var(--bg-card-hover)", padding: "16px", borderRadius: "12px", border: "1px solid var(--border-color)" }}>
+              <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                Client Name
+                <input 
+                  type="text" 
+                  value={clientData.name} 
+                  onChange={(e) => setClientData({ ...clientData, name: e.target.value })}
+                  style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                />
+              </label>
+              <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                Company Name
+                <input 
+                  type="text" 
+                  value={clientData.company} 
+                  onChange={(e) => setClientData({ ...clientData, company: e.target.value })}
+                  style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                />
+              </label>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  Contract Value (₹)
+                  <input 
+                    type="number" 
+                    value={clientData.dealAmount} 
+                    onChange={(e) => setClientData({ ...clientData, dealAmount: parseInt(e.target.value, 10) || 0 })}
+                    style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                  />
+                </label>
+                <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  Payment Phases
+                  <input 
+                    type="number" 
+                    value={clientData.paymentSteps} 
+                    onChange={(e) => setClientData({ ...clientData, paymentSteps: parseInt(e.target.value, 10) || 1 })}
+                    style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                  />
+                </label>
+              </div>
+              <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                Next Action
+                <input 
+                  type="text" 
+                  value={clientData.nextAction} 
+                  onChange={(e) => setClientData({ ...clientData, nextAction: e.target.value })}
+                  style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                />
+              </label>
+              <label style={{ fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                Due Schedule
+                <input 
+                  type="text" 
+                  value={clientData.due} 
+                  onChange={(e) => setClientData({ ...clientData, due: e.target.value })}
+                  style={{ width: "100%", padding: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", borderRadius: "6px", color: "var(--text-main)", fontSize: "12px", outline: 0 }}
+                />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", marginTop: "16px" }}>
+              <button 
+                type="button" 
+                style={{ flex: 1, height: "38px", background: "var(--bg-card)", border: "1px solid var(--border-color)", color: "var(--text-main)", borderRadius: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600 }}
+                onClick={() => setStep("ASK_NAME")}
+              >
+                Reset Flow
+              </button>
+              <button 
+                type="button" 
+                className="primary-button" 
+                style={{ flex: 1 }}
+                onClick={handleSave}
+              >
+                Save Client
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === "COMPLETED" && (
+          <div style={{ margin: "32px 0" }}>
+            <span style={{ fontSize: "40px", display: "block", marginBottom: "16px" }}>🎉</span>
+            <strong style={{ color: "var(--emerald)", fontSize: "16px", display: "block" }}>Onboarding Successful!</strong>
+            <p style={{ color: "var(--text-muted)", fontSize: "12px", marginTop: "6px" }}>
+              Saving to Supabase and closing...
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Voice Smart Scheduler Modal Component
+function VoiceSchedulerModal({
+  onClose,
+  onSubmit,
+  clients,
+  geminiApiKey,
+  addToast,
+}: {
+  onClose: () => void;
+  onSubmit: (tasks: any[], meetings: any[]) => Promise<void>;
+  clients: Client[];
+  geminiApiKey: string;
+  addToast: (msg: string, type?: Toast["type"]) => void;
+}) {
+  const [agendaText, setAgendaText] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [parsedItems, setParsedItems] = useState<any[]>([]);
+  
+  const recognitionRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const RecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (RecognitionClass) {
+        const rec = new RecognitionClass();
+        rec.continuous = true;
+        rec.interimResults = false;
+        rec.lang = "en-US";
+
+        rec.onresult = (e: any) => {
+          const resultText = e.results[e.results.length - 1][0].transcript.trim();
+          setAgendaText((prev) => (prev ? prev + " " + resultText : resultText));
+        };
+
+        rec.onend = () => {
+          setIsListening(false);
+        };
+
+        recognitionRef.current = rec;
+      }
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
+  }, []);
+
+  const startListening = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (err) {
+        console.warn("Recognition already started:", err);
+      }
+    }
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
+  };
+
+  const handleProcess = async () => {
+    stopListening();
+    if (!agendaText.trim()) {
+      addToast("Please speak or type your agenda first!", "warning");
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const result = await parseAgendaWithGemini(geminiApiKey, agendaText, clients);
+      if (result && Array.isArray(result.tasks)) {
+        setParsedItems(result.tasks);
+        addToast(`AI successfully parsed ${result.tasks.length} actions!`, "success");
+      } else {
+        addToast("AI parsed agenda but returned no tasks.", "info");
+      }
+    } catch (err: any) {
+      console.error(err);
+      addToast(`AI Processing failed: ${err.message || err}`, "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleSaveAll = async () => {
+    const tasksToInsert: any[] = [];
+    const meetingsToUpdate: any[] = [];
+
+    parsedItems.forEach((item) => {
+      const matchedClient = clients.find(
+        (c) => c.name.toLowerCase().includes(item.clientName.toLowerCase()) || 
+               item.clientName.toLowerCase().includes(c.name.toLowerCase())
+      );
+
+      if (item.type === "task") {
+        tasksToInsert.push({
+          title: item.title,
+          clientId: matchedClient ? matchedClient.id : null,
+          priority: "medium",
+          due: item.due,
+          done: false
+        });
+      } else if (item.type === "meeting") {
+        const formattedDate = getFormattedDueDate(item.due, item.time);
+        meetingsToUpdate.push({
+          clientId: matchedClient ? matchedClient.id : null,
+          clientName: item.clientName,
+          title: item.title,
+          due: formattedDate
+        });
+      }
+    });
+
+    try {
+      await onSubmit(tasksToInsert, meetingsToUpdate);
+      addToast(`Successfully scheduled ${parsedItems.length} actions!`, "success");
+      onClose();
+    } catch (err) {
+      console.error(err);
+      addToast("Failed to schedule parsed actions in database.", "error");
+    }
+  };
+
+  const RecognitionClass = typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+  return (
+    <div className="overlay modal-wrap" role="dialog" aria-modal="true" aria-label="Smart Voice Scheduler">
+      <div className="modal" style={{ width: "min(520px, 100%)" }}>
+        <button 
+          type="button" 
+          className="close" 
+          onClick={() => {
+            stopListening();
+            onClose();
+          }} 
+          aria-label="Close voice scheduler"
+        >
+          <XMarkIcon />
+        </button>
+
+        <span className="modal-icon" style={{ background: "linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(14, 165, 233, 0.1))", color: "var(--purple)", margin: "0 auto 16px" }}>
+          🎙️
+        </span>
+        <h2 style={{ textAlign: "center" }}>Smart Voice Scheduler</h2>
+        <p style={{ color: "var(--text-muted)", fontSize: "12px", marginBottom: "16px", textAlign: "center" }}>
+          Speak or type your agenda, and AI will parse & link meetings and tasks automatically.
+        </p>
+
+        {!RecognitionClass && (
+          <div style={{ background: "rgba(244, 63, 94, 0.08)", border: "1px solid rgba(244,63,94,0.15)", borderRadius: "8px", padding: "10px", fontSize: "11px", color: "var(--rose)", marginBottom: "16px" }}>
+            ⚠️ Web Speech API is not supported in this browser. You can type conversational sentences below.
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          <textarea
+            value={agendaText}
+            onChange={(e) => setAgendaText(e.target.value)}
+            placeholder={isListening ? "Listening... Speak your tasks or meetings..." : "Speak or type agenda (e.g. Tomorrow at 11 AM meet with Santosh Pawar to review design, and send invoice to Deepak)"}
+            style={{ width: "100%", height: "100px", padding: "12px", borderRadius: "8px", background: "var(--bg-input)", border: "1px solid var(--border-color)", color: "var(--text-main)", fontSize: "13px", resize: "none", outline: 0 }}
+          />
+
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button 
+              type="button" 
+              style={{ flex: 1, height: "38px", background: "var(--bg-card)", border: "1px solid var(--border-color)", color: "var(--text-main)", borderRadius: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+              className={isListening ? "danger" : ""}
+              onClick={() => {
+                if (isListening) stopListening();
+                else startListening();
+              }}
+            >
+              {isListening ? (
+                <>
+                  <span className="spinner-dot" style={{ width: 8, height: 8, background: "currentColor", borderRadius: "50%", animation: "pulseGlow 0.6s infinite alternate" }} />
+                  Stop Mic
+                </>
+              ) : (
+                "Start Mic"
+              )}
+            </button>
+            <button 
+              type="button" 
+              className="primary-button" 
+              style={{ flex: 1 }}
+              onClick={handleProcess}
+              disabled={isProcessing || !agendaText}
+            >
+              {isProcessing ? "AI Parsing..." : "Process with AI"}
+            </button>
+          </div>
+        </div>
+
+        {isProcessing && (
+          <div style={{ textAlign: "center", margin: "24px 0" }}>
+            <span style={{ display: "inline-block", width: "24px", height: "24px", border: "3px solid var(--purple-soft)", borderTopColor: "var(--purple)", borderRadius: "50%", animation: "spin 1s linear infinite", marginBottom: "8px" }} />
+            <p style={{ fontSize: "12px", color: "var(--text-muted)" }}>Gemini is structuring your tasks...</p>
+          </div>
+        )}
+
+        {!isProcessing && parsedItems.length > 0 && (
+          <div style={{ marginTop: "24px", textAlign: "left" }}>
+            <h3 style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.5px", color: "var(--text-light)", marginBottom: "12px" }}>
+              Extracted Actions Preview
+            </h3>
+            
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "200px", overflowY: "auto", paddingRight: "4px" }}>
+              {parsedItems.map((item, i) => {
+                const matched = clients.find(
+                  (c) => c.name.toLowerCase().includes(item.clientName.toLowerCase()) || 
+                         item.clientName.toLowerCase().includes(c.name.toLowerCase())
+                );
+                
+                return (
+                  <div key={i} style={{ padding: "10px 12px", background: "var(--bg-card-hover)", borderRadius: "8px", border: "1px solid var(--border-color)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <strong style={{ fontSize: "13px", display: "block", color: "var(--text-main)" }}>{item.title}</strong>
+                      <small style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                        {item.type === "meeting" ? "📅 Meeting" : "📋 Task"} • {item.due} {item.time ? `at ${item.time}` : ""}
+                      </small>
+                    </div>
+                    <span style={{ fontSize: "10px", fontWeight: 700, padding: "4px 8px", borderRadius: "6px", background: matched ? "var(--purple-soft)" : "rgba(100,116,139,0.08)", color: matched ? "var(--purple)" : "var(--text-muted)" }}>
+                      {matched ? matched.name : "General"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+
+            <button 
+              type="button" 
+              className="primary-button" 
+              style={{ width: "100%", marginTop: "16px", padding: "12px" }}
+              onClick={handleSaveAll}
+            >
+              Confirm and Schedule All
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Profile edit form dialog modal sub-component
 function ProfileModal({
   adminName,
@@ -2564,12 +3543,14 @@ function SettingsModal({
   onSaveWorkspace,
   theme,
   setTheme,
+  geminiApiKey,
 }: {
   currentWorkspace: string;
   onClose: () => void;
-  onSaveWorkspace: (workspace: string) => void;
+  onSaveWorkspace: (workspace: string, geminiKey: string) => void;
   theme: "light" | "dark";
   setTheme: (theme: "light" | "dark") => void;
+  geminiApiKey: string;
 }) {
   return (
     <div className="overlay modal-wrap" role="dialog" aria-modal="true" aria-label="System Settings">
@@ -2579,7 +3560,8 @@ function SettingsModal({
           e.preventDefault();
           const form = e.currentTarget;
           const ws = (form.elements.namedItem("workspace") as HTMLInputElement).value.trim();
-          onSaveWorkspace(ws);
+          const gKey = (form.elements.namedItem("geminiKey") as HTMLInputElement).value.trim();
+          onSaveWorkspace(ws, gKey);
           onClose();
         }}
       >
@@ -2597,6 +3579,17 @@ function SettingsModal({
           <label>
             Workspace Name *
             <input name="workspace" required defaultValue={currentWorkspace} placeholder="e.g. My Workspace" autoFocus />
+          </label>
+
+          <label>
+            Gemini API Key (for Voice AI features)
+            <input 
+              name="geminiKey" 
+              type="password" 
+              defaultValue={geminiApiKey} 
+              placeholder="Enter Gemini API key" 
+              style={{ width: "100%", padding: "10px", borderRadius: "8px", border: "1px solid var(--border-color)", background: "var(--bg-input)", color: "var(--text-main)" }}
+            />
           </label>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid var(--border-color)", padding: "12px", borderRadius: "8px", background: "var(--bg-card)" }}>
@@ -2848,12 +3841,14 @@ function TasksPage({
   onToggle,
   onDelete,
   onAddTask,
+  onStartVoiceScheduler,
 }: {
   tasks: Task[];
   clients: Client[];
   onToggle: (id: number) => void;
   onDelete: (id: number) => void;
   onAddTask: (title: string, clientId: number | undefined, priority: Task["priority"], due: string) => void;
+  onStartVoiceScheduler: () => void;
 }) {
   const [view, setView] = useState<"All" | "Open" | "Completed">("All");
   const [clientFilter, setClientFilter] = useState<string>("All"); // "All" | "General" | clientId
@@ -2901,9 +3896,19 @@ function TasksPage({
               </button>
             ))}
           </div>
-          <button className="primary-button" onClick={() => setAddModalOpen(true)}>
-            <PlusIcon /> Add Task
-          </button>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button 
+              type="button"
+              className="primary-button" 
+              style={{ background: "linear-gradient(135deg, var(--purple), var(--sky))", display: "inline-flex", gap: "6px" }}
+              onClick={onStartVoiceScheduler}
+            >
+              🎙️ Smart Voice Schedule
+            </button>
+            <button className="primary-button" onClick={() => setAddModalOpen(true)}>
+              <PlusIcon /> Add Task
+            </button>
+          </div>
         </div>
 
         {/* Row 2: Search, client filters, sorting */}
