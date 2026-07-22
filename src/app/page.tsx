@@ -936,6 +936,31 @@ export default function Home() {
     }
   };
 
+  const handleUpdateClientLogo = async (clientId: number, logoBase64: string | null) => {
+    setClients((prev) =>
+      prev.map((c) => {
+        if (c.id === clientId) {
+          const updated = { ...c, logo: logoBase64 || undefined };
+          setSelected(updated);
+          return updated;
+        }
+        return c;
+      })
+    );
+
+    try {
+      const { error } = await supabase
+        .from("clients")
+        .update({ logo: logoBase64 })
+        .eq("id", clientId);
+      if (error) throw error;
+      addToast("Client photo successfully updated!", "success");
+    } catch (err) {
+      console.error("Failed to update client logo:", err);
+      addToast("Failed to update client photo in database.", "error");
+    }
+  };
+
   const handleTogglePayment = async (clientId: number, paidSteps: number) => {
     let clientName = "";
     let updatedClient: Client | null = null;
@@ -1962,6 +1987,7 @@ export default function Home() {
           onAddTask={handleAddTask}
           onTogglePayment={handleTogglePayment}
           onEdit={() => setEditOpen(true)}
+          onUpdateLogo={handleUpdateClientLogo}
         />
       )}
 
@@ -2072,6 +2098,7 @@ function ClientPanel({
   onAddTask,
   onTogglePayment,
   onEdit,
+  onUpdateLogo,
 }: {
   client: Client;
   onClose: () => void;
@@ -2082,6 +2109,7 @@ function ClientPanel({
   onAddTask: (title: string, clientId: number) => void;
   onTogglePayment: (clientId: number, paidSteps: number) => void;
   onEdit: () => void;
+  onUpdateLogo: (clientId: number, logoBase64: string | null) => Promise<void>;
 }) {
   return (
     <div className="overlay" role="dialog" aria-modal="true" aria-label={`${client.name} client profile`}>
@@ -2091,11 +2119,71 @@ function ClientPanel({
         </button>
 
         <div className="profile-hero">
-          <Avatar client={client} size="lg" />
+          <div style={{ position: "relative", cursor: "pointer", display: "inline-block" }} title="Change photo">
+            <Avatar client={client} size="lg" />
+            <label 
+              htmlFor="direct-logo-upload" 
+              style={{ 
+                position: "absolute", 
+                bottom: "-2px", 
+                right: "-2px", 
+                background: "var(--purple)", 
+                color: "#ffffff", 
+                borderRadius: "50%", 
+                width: "24px", 
+                height: "24px", 
+                display: "flex", 
+                alignItems: "center", 
+                justifyContent: "center", 
+                boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
+                cursor: "pointer"
+              }}
+            >
+              <PencilIcon style={{ width: 12, height: 12 }} />
+            </label>
+            <input 
+              id="direct-logo-upload" 
+              type="file" 
+              accept="image/*" 
+              style={{ display: "none" }} 
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  const reader = new FileReader();
+                  reader.onloadend = () => {
+                    onUpdateLogo(client.id, reader.result as string);
+                  };
+                  reader.readAsDataURL(file);
+                }
+              }}
+            />
+          </div>
           <div>
             <StageBadge stage={client.stage} />
             <h2>{client.company || "Independent"}</h2>
             <p>{client.name}</p>
+            {client.logo && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (confirm("Remove current photo?")) {
+                    onUpdateLogo(client.id, null);
+                  }
+                }}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--rose)",
+                  fontSize: "11px",
+                  cursor: "pointer",
+                  marginTop: "4px",
+                  padding: 0,
+                  display: "block"
+                }}
+              >
+                Remove photo
+              </button>
+            )}
           </div>
         </div>
 
