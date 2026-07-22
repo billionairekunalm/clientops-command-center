@@ -3135,7 +3135,7 @@ function VoiceOnboardModal({
                     else startListening();
                   }}
                 >
-                  {isListening ? "Mute Microphone" : "Unmute Mic"}
+                  {isListening ? "Pause Listening" : "Start Listening"}
                 </button>
                 <button 
                   type="submit" 
@@ -3527,10 +3527,10 @@ function VoiceSchedulerModal({
               {isListening ? (
                 <>
                   <span className="spinner-dot" style={{ width: 8, height: 8, background: "currentColor", borderRadius: "50%", animation: "pulseGlow 0.6s infinite alternate" }} />
-                  Stop Mic
+                  Pause Listening
                 </>
               ) : (
-                "Start Mic"
+                "Start Listening"
               )}
             </button>
             <button 
