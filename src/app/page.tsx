@@ -408,6 +408,7 @@ export default function Home() {
   const [isSettingsOpen, setSettingsOpen] = useState(false);
   const [isVoiceOnboardOpen, setVoiceOnboardOpen] = useState(false);
   const [isVoiceSchedulerOpen, setVoiceSchedulerOpen] = useState(false);
+  const [isChatOnboardOpen, setChatOnboardOpen] = useState(false);
   const [isLoggedOut, setIsLoggedOut] = useState(false);
 
   const handleSaveProfile = async (name: string, role: string, initials: string, avatarUrl: string) => {
@@ -1309,6 +1310,66 @@ export default function Home() {
     }
   };
 
+  const handleChatOnboardingSubmit = async (data: Partial<Client>) => {
+    const name = data.name || "New client";
+    const company = data.company || "Independent";
+    const dealAmount = data.dealAmount || 0;
+    const paymentSteps = data.paymentSteps || 1;
+    const nextAction = data.nextAction || "Schedule first follow-up";
+    const due = getFormattedDueDate(data.due || "Today");
+    const tone = data.tone || "violet";
+    const initials = data.initials || "CL";
+
+    const newClientId = getNextUniqueId();
+    const newClient: Client = {
+      id: newClientId,
+      name,
+      company,
+      initials,
+      tone,
+      stage: "Proposal",
+      health: "green",
+      priority: 50,
+      nextAction,
+      due,
+      note: "Onboarded via Chat Onboard Copilot.",
+      timeline: [
+        { id: getNextUniqueId(), title: "Chat onboarding", desc: "Profile onboarded using Chat Onboard Copilot dialogue.", date: "Today" },
+      ],
+      eventType: "task",
+      dealAmount,
+      paymentSteps,
+      paidSteps: 0
+    };
+
+    setClients((current) => [newClient, ...current]);
+    setSelected(newClient);
+
+    try {
+      const { error } = await supabase.from("clients").insert([{
+        id: newClient.id,
+        name: newClient.name,
+        company: newClient.company,
+        initials: newClient.initials,
+        tone: newClient.tone,
+        stage: newClient.stage,
+        health: newClient.health,
+        priority: newClient.priority,
+        next_action: newClient.nextAction,
+        due: newClient.due,
+        note: newClient.note,
+        timeline: newClient.timeline,
+        event_type: newClient.eventType,
+        deal_amount: newClient.dealAmount,
+        payment_steps: newClient.paymentSteps,
+        paid_steps: newClient.paidSteps
+      }]);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Supabase insert chat client failed:", err);
+    }
+  };
+
   // Parse clients to populate dynamic events on the calendar
   const calendarEvents = useMemo(() => {
     return clients.map((client) => {
@@ -1961,6 +2022,7 @@ export default function Home() {
               }
               setVoiceSchedulerOpen(true);
             }}
+            onStartChatOnboard={() => setChatOnboardOpen(true)}
           />
         )}
 
@@ -2067,6 +2129,15 @@ export default function Home() {
           onSubmit={handleVoiceScheduleSubmit}
           clients={clients}
           geminiApiKey={geminiApiKey}
+          addToast={addToast}
+        />
+      )}
+
+      {/* Chat Onboarding Copilot Modal */}
+      {isChatOnboardOpen && (
+        <ChatOnboardModal
+          onClose={() => setChatOnboardOpen(false)}
+          onSubmit={handleChatOnboardingSubmit}
           addToast={addToast}
         />
       )}
@@ -2972,6 +3043,17 @@ function VoiceOnboardModal({
           }
         };
 
+        rec.onerror = (event: any) => {
+          console.error("Speech Recognition Error:", event.error);
+          if (event.error === "not-allowed") {
+            addToast("Microphone permission denied! Please allow microphone access in browser settings.", "error");
+          } else if (event.error === "no-speech") {
+            console.warn("Speech recognition: no speech detected.");
+          } else {
+            addToast(`Speech Recognition issue: ${event.error}`, "warning");
+          }
+        };
+
         rec.onend = () => {
           setIsListening(false);
           stopVolumeTracking();
@@ -2990,7 +3072,7 @@ function VoiceOnboardModal({
       }
       stopVolumeTracking();
     };
-  }, [stopVolumeTracking]);
+  }, [stopVolumeTracking, addToast]);
 
   // Stop listening helper
   const stopListening = useCallback(() => {
@@ -3018,14 +3100,30 @@ function VoiceOnboardModal({
   // Speaks text, and once finished, automatically starts listening
   const speakAndListen = useCallback((text: string) => {
     stopListening();
-    if (!synthRef.current) return;
+    if (!synthRef.current) {
+      startListening();
+      return;
+    }
     
     synthRef.current.cancel(); // Cancel any current utterances
     const utterance = new SpeechSynthesisUtterance(text);
     activeUtteranceRef.current = utterance;
     
-    utterance.onend = () => {
+    // Safety timer to prevent SpeechSynthesis hanging in Chrome
+    const safetyTimer = setTimeout(() => {
+      console.warn("Speech synthesis hung or took too long, starting mic automatically.");
       startListening();
+    }, 6000); // 6 seconds safety limit
+
+    utterance.onend = () => {
+      clearTimeout(safetyTimer);
+      startListening();
+    };
+    
+    utterance.onerror = (e) => {
+      console.error("SpeechSynthesis error:", e);
+      clearTimeout(safetyTimer);
+      startListening(); // fallback
     };
     
     synthRef.current.speak(utterance);
@@ -3447,6 +3545,17 @@ function VoiceSchedulerModal({
           }
         };
 
+        rec.onerror = (event: any) => {
+          console.error("Speech Recognition Error:", event.error);
+          if (event.error === "not-allowed") {
+            addToast("Microphone permission denied! Please allow microphone access in browser settings.", "error");
+          } else if (event.error === "no-speech") {
+            console.warn("Speech recognition: no speech detected.");
+          } else {
+            addToast(`Speech Recognition issue: ${event.error}`, "warning");
+          }
+        };
+
         rec.onend = () => {
           setIsListening(false);
           stopVolumeTracking();
@@ -3462,7 +3571,7 @@ function VoiceSchedulerModal({
       }
       stopVolumeTracking();
     };
-  }, [stopVolumeTracking]);
+  }, [stopVolumeTracking, addToast]);
 
   const startListening = () => {
     if (recognitionRef.current) {
@@ -4102,6 +4211,7 @@ function TasksPage({
   onDelete,
   onAddTask,
   onStartVoiceScheduler,
+  onStartChatOnboard,
 }: {
   tasks: Task[];
   clients: Client[];
@@ -4109,6 +4219,7 @@ function TasksPage({
   onDelete: (id: number) => void;
   onAddTask: (title: string, clientId: number | undefined, priority: Task["priority"], due: string) => void;
   onStartVoiceScheduler: () => void;
+  onStartChatOnboard: () => void;
 }) {
   const [view, setView] = useState<"All" | "Open" | "Completed">("All");
   const [clientFilter, setClientFilter] = useState<string>("All"); // "All" | "General" | clientId
@@ -4157,6 +4268,14 @@ function TasksPage({
             ))}
           </div>
           <div style={{ display: "flex", gap: "8px" }}>
+            <button 
+              type="button"
+              className="primary-button" 
+              style={{ background: "linear-gradient(135deg, var(--sky), var(--purple))", display: "inline-flex", gap: "6px" }}
+              onClick={onStartChatOnboard}
+            >
+              💬 Chat Onboard
+            </button>
             <button 
               type="button"
               className="primary-button" 
@@ -4566,5 +4685,252 @@ function CalendarPage({
         </div>
       )}
     </section>
+  );
+}
+
+// Conversational Chat Onboarding Modal Component
+interface ChatMessage {
+  id: number;
+  sender: "bot" | "user";
+  text: string;
+  time: string;
+}
+
+function ChatOnboardModal({
+  onClose,
+  onSubmit,
+  addToast,
+}: {
+  onClose: () => void;
+  onSubmit: (client: Partial<Client>) => Promise<void>;
+  addToast: (msg: string, type?: Toast["type"]) => void;
+}) {
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 1,
+      sender: "bot",
+      text: "Hey! 👋 Ready to onboard a new client? Let's get them set up together like good friends. First, what's their name?",
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    },
+  ]);
+  const [inputText, setInputText] = useState("");
+  const [chatStep, setChatStep] = useState<"name" | "company" | "amount" | "phases" | "action" | "due" | "saving" | "completed">("name");
+  
+  const [clientData, setClientData] = useState({
+    name: "",
+    company: "",
+    dealAmount: 0,
+    paymentSteps: 1,
+    nextAction: "",
+    due: "Today",
+  });
+
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const reply = inputText.trim();
+    if (!reply) return;
+
+    // 1. Add user reply to messages
+    const userMsg: ChatMessage = {
+      id: Date.now(),
+      sender: "user",
+      text: reply,
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    setInputText("");
+
+    // Helper to add bot messages after a short delay
+    const addBotReply = (text: string) => {
+      setTimeout(() => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            sender: "bot",
+            text,
+            time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          },
+        ]);
+      }, 500);
+    };
+
+    // 2. State machine transitions
+    if (chatStep === "name") {
+      setClientData((prev) => ({ ...prev, name: reply }));
+      setChatStep("company");
+      addBotReply(`Awesome name! 💫 Now, what company or brand does ${reply} represent? (You can type "Independent" if they work solo)`);
+    } else if (chatStep === "company") {
+      const coName = reply.toLowerCase() === "independent" ? "" : reply;
+      setClientData((prev) => ({ ...prev, company: coName }));
+      setChatStep("amount");
+      addBotReply(`Got it! ${reply} it is. Let's talk money - what is the contract deal amount in Rupees?`);
+    } else if (chatStep === "amount") {
+      const parsedAmount = parseInt(reply.replace(/,/g, "").match(/\d+/)?.[0] || "50000", 10);
+      setClientData((prev) => ({ ...prev, dealAmount: parsedAmount }));
+      setChatStep("phases");
+      addBotReply(`₹${parsedAmount.toLocaleString("en-IN")} - excellent contract! 💰 How many payment milestone steps or phases are we dividing this into?`);
+    } else if (chatStep === "phases") {
+      const parsedPhases = parseInt(reply.match(/\d+/)?.[0] || "1", 10);
+      setClientData((prev) => ({ ...prev, paymentSteps: parsedPhases }));
+      setChatStep("action");
+      addBotReply(`Great, ${parsedPhases} milestone phases setup! What is the very next action or follow-up task we need to schedule for them?`);
+    } else if (chatStep === "action") {
+      setClientData((prev) => ({ ...prev, nextAction: reply }));
+      setChatStep("due");
+      addBotReply(`Got it. And when is this action due? (e.g. Today, Tomorrow, next Friday, or a date like 2026-08-01)`);
+    } else if (chatStep === "due") {
+      const finalDue = reply;
+      setChatStep("saving");
+      addBotReply(`Perfect! I have got all details. Let me write this down to your command center...`);
+      
+      const initials = clientData.name
+        .split(" ")
+        .map((n) => n[0])
+        .slice(0, 2)
+        .join("")
+        .toUpperCase() || "CL";
+      const tones = ["violet", "blue", "emerald", "rose", "amber"];
+      const tone = tones[Math.floor(Math.random() * tones.length)];
+
+      try {
+        await onSubmit({
+          name: clientData.name,
+          company: clientData.company,
+          dealAmount: clientData.dealAmount,
+          paymentSteps: clientData.paymentSteps,
+          nextAction: clientData.nextAction,
+          due: finalDue,
+          tone,
+          initials,
+        });
+        setChatStep("completed");
+        addBotReply(`🎉 Success! Client ${clientData.name} has been fully onboarded and added to your dashboard!`);
+        setTimeout(() => {
+          onClose();
+        }, 2000);
+      } catch (err) {
+        console.error(err);
+        setChatStep("due"); // Reset step
+        addBotReply(`⚠️ Oh no, I ran into an error saving the client to the database. Let's try specifying the due date again!`);
+        addToast("Failed to onboard client via chat.", "error");
+      }
+    }
+  };
+
+  return (
+    <div className="overlay modal-wrap" role="dialog" aria-modal="true" aria-label="Chat onboarding copilot">
+      <div className="modal" style={{ width: "min(540px, 100%)", display: "flex", flexDirection: "column", padding: 0, overflow: "hidden", background: "var(--bg-modal)", border: "1px solid var(--border-color)", borderRadius: "16px" }}>
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 20px", borderBottom: "1px solid var(--border-color)", background: "var(--bg-card-hover)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <span style={{ fontSize: "20px" }}>💬</span>
+            <div style={{ textAlign: "left" }}>
+              <strong style={{ fontSize: "14px", color: "var(--text-main)", display: "block" }}>Chat Onboarding Copilot</strong>
+              <small style={{ fontSize: "11px", color: "var(--text-muted)" }}>Friendly Assistant</small>
+            </div>
+          </div>
+          <button 
+            type="button" 
+            className="close" 
+            onClick={onClose} 
+            aria-label="Close chat"
+            style={{ position: "static", background: "transparent", border: 0, padding: 4 }}
+          >
+            <XMarkIcon style={{ width: 20 }} />
+          </button>
+        </div>
+
+        {/* Messages body */}
+        <div style={{ flex: 1, padding: "20px", overflowY: "auto", maxHeight: "380px", minHeight: "300px", display: "flex", flexDirection: "column", gap: "14px", background: "var(--bg-card)" }}>
+          {messages.map((msg) => {
+            const isBot = msg.sender === "bot";
+            return (
+              <div 
+                key={msg.id} 
+                style={{ 
+                  display: "flex", 
+                  justifyContent: isBot ? "flex-start" : "flex-end", 
+                  alignItems: "flex-end", 
+                  gap: "8px" 
+                }}
+              >
+                {isBot && (
+                  <span style={{ width: "26px", height: "26px", borderRadius: "50%", background: "var(--purple)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "12px", color: "#ffffff", fontWeight: "bold" }}>
+                    🤖
+                  </span>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: "2px", maxWidth: "75%" }}>
+                  <div 
+                    style={{ 
+                      padding: "10px 14px", 
+                      borderRadius: isBot ? "16px 16px 16px 4px" : "16px 16px 4px 16px", 
+                      background: isBot ? "var(--bg-card-hover)" : "var(--purple)", 
+                      color: isBot ? "var(--text-main)" : "#ffffff", 
+                      fontSize: "13px", 
+                      lineHeight: "1.4",
+                      textAlign: "left",
+                      border: isBot ? "1px solid var(--border-color)" : "none"
+                    }}
+                  >
+                    {msg.text}
+                  </div>
+                  <small style={{ fontSize: "9px", color: "var(--text-muted)", alignSelf: isBot ? "flex-start" : "flex-end", padding: "0 4px" }}>
+                    {msg.time}
+                  </small>
+                </div>
+              </div>
+            );
+          })}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Input area */}
+        {chatStep !== "completed" && chatStep !== "saving" && (
+          <form 
+            onSubmit={handleSend}
+            style={{ 
+              display: "flex", 
+              gap: "8px", 
+              padding: "12px 16px", 
+              borderTop: "1px solid var(--border-color)", 
+              background: "var(--bg-card-hover)" 
+            }}
+          >
+            <input 
+              type="text" 
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              placeholder="Type your message here..."
+              autoFocus
+              style={{ 
+                flex: 1, 
+                padding: "10px 14px", 
+                borderRadius: "8px", 
+                border: "1px solid var(--border-color)", 
+                background: "var(--bg-input)", 
+                color: "var(--text-main)", 
+                fontSize: "13px", 
+                outline: 0 
+              }}
+            />
+            <button 
+              type="submit" 
+              className="primary-button" 
+              style={{ padding: "0 18px", borderRadius: "8px" }}
+            >
+              Send
+            </button>
+          </form>
+        )}
+      </div>
+    </div>
   );
 }
