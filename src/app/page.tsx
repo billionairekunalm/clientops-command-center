@@ -219,7 +219,7 @@ We have the following registered clients: ${JSON.stringify(clientsContext)}.
 Extract all tasks or meetings mentioned in the agenda. Match the "clientName" in each item to one of our registered clients (return the exact client name or matching client ID if found, or empty string if it's a general task).
 Return the result strictly conforming to the requested schema.`;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
   const schema = {
     type: "OBJECT",
     properties: {
