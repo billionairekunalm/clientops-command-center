@@ -4732,7 +4732,7 @@ function ChatOnboardModal({
     {
       id: 1,
       sender: "bot",
-      text: "Hey! 👋 Ready to onboard a new client? Let's get them set up together like good friends. First, what's their name?",
+      text: "What is the client's name?",
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     },
   ]);
@@ -4785,33 +4785,33 @@ function ChatOnboardModal({
           },
         ]);
         setIsBotTyping(false);
-      }, 750);
+      }, 400);
     };
 
     // 2. State machine transitions
     if (chatStep === "name") {
       setClientData((prev) => ({ ...prev, name: reply }));
       setChatStep("company");
-      addBotReply(`Awesome name! 💫 Now, what company or brand does ${reply} represent? (You can type "Independent" if they work solo)`);
+      addBotReply(`Company name? (or type "Independent")`);
     } else if (chatStep === "company") {
       const coName = reply.toLowerCase() === "independent" ? "" : reply;
       setClientData((prev) => ({ ...prev, company: coName }));
       setChatStep("amount");
-      addBotReply(`Got it! ${reply} it is. Let's talk money - what is the contract deal amount in Rupees?`);
+      addBotReply(`Contract deal amount (in ₹)?`);
     } else if (chatStep === "amount") {
       const parsedAmount = parseInt(reply.replace(/,/g, "").match(/\d+/)?.[0] || "50000", 10);
       setClientData((prev) => ({ ...prev, dealAmount: parsedAmount }));
       setChatStep("phases");
-      addBotReply(`₹${parsedAmount.toLocaleString("en-IN")} - excellent contract! 💰 How many payment milestone steps or phases are we dividing this into?`);
+      addBotReply(`How many payment milestone steps/phases?`);
     } else if (chatStep === "phases") {
       const parsedPhases = parseInt(reply.match(/\d+/)?.[0] || "1", 10);
       setClientData((prev) => ({ ...prev, paymentSteps: parsedPhases }));
       setChatStep("action");
-      addBotReply(`Great, ${parsedPhases} milestone phases setup! What is the very next action or follow-up task we need to schedule for them?`);
+      addBotReply(`What is the next action or task?`);
     } else if (chatStep === "action") {
       setClientData((prev) => ({ ...prev, nextAction: reply }));
       setChatStep("due");
-      addBotReply(`Got it. And when is this action due? (e.g. Today, Tomorrow, next Friday, or a date like 2026-08-01)`);
+      addBotReply(`When is this due? (e.g., Today, Tomorrow, or YYYY-MM-DD)`);
     } else if (chatStep === "due") {
       const finalDue = reply;
       setChatStep("saving");
@@ -4837,10 +4837,10 @@ function ChatOnboardModal({
           initials,
         });
         setChatStep("completed");
-        addBotReply(`🎉 Success! Client ${clientData.name} has been fully onboarded and added to your dashboard!`);
+        addBotReply(`🎉 Client ${clientData.name} onboarded successfully!`);
         setTimeout(() => {
           onClose();
-        }, 2000);
+        }, 1500);
       } catch (err) {
         console.error(err);
         setChatStep("due"); // Reset step
@@ -4850,7 +4850,7 @@ function ChatOnboardModal({
           {
             id: Date.now() + 2,
             sender: "bot",
-            text: `⚠️ Oh no, I ran into an error saving the client to the database. Make sure you ran the SQL ALTER TABLE scripts in your Supabase SQL editor. Let's try specifying the due date again!`,
+            text: `⚠️ Database insert error. Please try again!`,
             time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
           },
         ]);
