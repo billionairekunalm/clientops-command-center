@@ -270,18 +270,34 @@ Return the result strictly conforming to the requested schema.`;
 
 const getFormattedDueDate = (category: string, timeStr?: string) => {
   const date = new Date();
-  if (category === "Tomorrow") {
+  const clean = category.toLowerCase().trim();
+
+  if (clean === "tomorrow") {
     date.setDate(date.getDate() + 1);
-  } else if (category === "Friday") {
+  } else if (clean === "friday") {
     const day = date.getDay();
     const daysUntilFriday = (5 - day + 7) % 7 || 7;
     date.setDate(date.getDate() + daysUntilFriday);
-  } else if (category === "This week") {
+  } else if (clean === "this week") {
     const day = date.getDay();
     const daysUntilSunday = (7 - day) % 7;
     date.setDate(date.getDate() + daysUntilSunday);
-  } else if (category === "Later") {
+  } else if (clean === "later") {
     date.setDate(date.getDate() + 7);
+  } else if (clean.startsWith("in ") && clean.endsWith(" days")) {
+    const num = parseInt(clean.replace("in ", "").replace(" days", "").trim(), 10);
+    if (!isNaN(num)) date.setDate(date.getDate() + num);
+  } else if (clean.startsWith("in ") && clean.endsWith(" weeks")) {
+    const num = parseInt(clean.replace("in ", "").replace(" weeks", "").trim(), 10);
+    if (!isNaN(num)) date.setDate(date.getDate() + num * 7);
+  } else {
+    // Try to parse standard dates like YYYY-MM-DD or MM/DD/YYYY
+    const parsed = new Date(category);
+    if (!isNaN(parsed.getTime())) {
+      date.setFullYear(parsed.getFullYear());
+      date.setMonth(parsed.getMonth());
+      date.setDate(parsed.getDate());
+    }
   }
   
   const yyyy = date.getFullYear();
@@ -1367,6 +1383,8 @@ export default function Home() {
       if (error) throw error;
     } catch (err) {
       console.error("Supabase insert chat client failed:", err);
+      addToast("Supabase insert client failed. Please make sure the ALTER TABLE query has been run in your Supabase dashboard.", "warning");
+      throw err;
     }
   };
 
@@ -2138,7 +2156,6 @@ export default function Home() {
         <ChatOnboardModal
           onClose={() => setChatOnboardOpen(false)}
           onSubmit={handleChatOnboardingSubmit}
-          addToast={addToast}
         />
       )}
 
@@ -4699,11 +4716,9 @@ interface ChatMessage {
 function ChatOnboardModal({
   onClose,
   onSubmit,
-  addToast,
 }: {
   onClose: () => void;
   onSubmit: (client: Partial<Client>) => Promise<void>;
-  addToast: (msg: string, type?: Toast["type"]) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -4715,6 +4730,7 @@ function ChatOnboardModal({
   ]);
   const [inputText, setInputText] = useState("");
   const [chatStep, setChatStep] = useState<"name" | "company" | "amount" | "phases" | "action" | "due" | "saving" | "completed">("name");
+  const [isBotTyping, setIsBotTyping] = useState(false);
   
   const [clientData, setClientData] = useState({
     name: "",
@@ -4729,12 +4745,12 @@ function ChatOnboardModal({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, isBotTyping]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     const reply = inputText.trim();
-    if (!reply) return;
+    if (!reply || isBotTyping) return;
 
     // 1. Add user reply to messages
     const userMsg: ChatMessage = {
@@ -4746,6 +4762,7 @@ function ChatOnboardModal({
 
     setMessages((prev) => [...prev, userMsg]);
     setInputText("");
+    setIsBotTyping(true);
 
     // Helper to add bot messages after a short delay
     const addBotReply = (text: string) => {
@@ -4759,7 +4776,8 @@ function ChatOnboardModal({
             time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
           },
         ]);
-      }, 500);
+        setIsBotTyping(false);
+      }, 750);
     };
 
     // 2. State machine transitions
@@ -4789,7 +4807,6 @@ function ChatOnboardModal({
     } else if (chatStep === "due") {
       const finalDue = reply;
       setChatStep("saving");
-      addBotReply(`Perfect! I have got all details. Let me write this down to your command center...`);
       
       const initials = clientData.name
         .split(" ")
@@ -4819,8 +4836,16 @@ function ChatOnboardModal({
       } catch (err) {
         console.error(err);
         setChatStep("due"); // Reset step
-        addBotReply(`⚠️ Oh no, I ran into an error saving the client to the database. Let's try specifying the due date again!`);
-        addToast("Failed to onboard client via chat.", "error");
+        setIsBotTyping(false);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 2,
+            sender: "bot",
+            text: `⚠️ Oh no, I ran into an error saving the client to the database. Make sure you ran the SQL ALTER TABLE scripts in your Supabase SQL editor. Let's try specifying the due date again!`,
+            time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          },
+        ]);
       }
     }
   };
@@ -4889,6 +4914,18 @@ function ChatOnboardModal({
               </div>
             );
           })}
+          {isBotTyping && (
+            <div style={{ display: "flex", justifyContent: "flex-start", alignItems: "flex-end", gap: "8px" }}>
+              <span style={{ width: "26px", height: "26px", borderRadius: "50%", background: "var(--purple)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "12px", color: "#ffffff", fontWeight: "bold" }}>
+                🤖
+              </span>
+              <div style={{ padding: "10px 14px", borderRadius: "16px 16px 16px 4px", background: "var(--bg-card-hover)", border: "1px solid var(--border-color)", display: "flex", gap: "4px", alignItems: "center" }}>
+                <span className="spinner-dot" style={{ width: "6px", height: "6px", background: "var(--text-muted)", borderRadius: "50%", animation: "pulseGlow 0.6s infinite alternate 0.1s" }} />
+                <span className="spinner-dot" style={{ width: "6px", height: "6px", background: "var(--text-muted)", borderRadius: "50%", animation: "pulseGlow 0.6s infinite alternate 0.2s" }} />
+                <span className="spinner-dot" style={{ width: "6px", height: "6px", background: "var(--text-muted)", borderRadius: "50%", animation: "pulseGlow 0.6s infinite alternate 0.3s" }} />
+              </div>
+            </div>
+          )}
           <div ref={messagesEndRef} />
         </div>
 
@@ -4908,23 +4945,26 @@ function ChatOnboardModal({
               type="text" 
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="Type your message here..."
+              placeholder={isBotTyping ? "Friend is typing..." : "Type your message here..."}
+              disabled={isBotTyping}
               autoFocus
               style={{ 
                 flex: 1, 
                 padding: "10px 14px", 
                 borderRadius: "8px", 
                 border: "1px solid var(--border-color)", 
-                background: "var(--bg-input)", 
+                background: isBotTyping ? "var(--bg-card-hover)" : "var(--bg-input)", 
                 color: "var(--text-main)", 
                 fontSize: "13px", 
-                outline: 0 
+                outline: 0,
+                opacity: isBotTyping ? 0.6 : 1
               }}
             />
             <button 
               type="submit" 
               className="primary-button" 
-              style={{ padding: "0 18px", borderRadius: "8px" }}
+              disabled={isBotTyping}
+              style={{ padding: "0 18px", borderRadius: "8px", opacity: isBotTyping ? 0.6 : 1 }}
             >
               Send
             </button>
